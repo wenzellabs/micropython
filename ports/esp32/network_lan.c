@@ -111,7 +111,56 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
     lan_if_obj_t *self = &lan_obj;
 
     if (self->initialized) {
-        return MP_OBJ_FROM_PTR(&lan_obj);
+        // Verify handles are still valid
+        if (self->eth_handle != NULL && self->base.netif != NULL) {
+            ESP_LOGI("lan", "Returning existing LAN instance");
+            return MP_OBJ_FROM_PTR(&lan_obj);
+        }
+        // Handles invalid - force cleanup
+        ESP_LOGW("lan", "LAN marked initialized but handles invalid, forcing cleanup");
+    }
+    
+    // Cleanup if ANY resources detected (handles aborted init)
+    if (self->eth_handle != NULL || self->base.netif != NULL || 
+        self->phy != NULL || self->base.active) {
+        
+        ESP_LOGW("lan", "Detected leaked resources, forcing cleanup");
+        ESP_LOGI("lan", "  eth_handle=%p netif=%p phy=%p active=%d initialized=%d",
+                 self->eth_handle, self->base.netif, self->phy, 
+                 self->base.active, self->initialized);
+        
+        // Unregister event handlers (ignore errors)
+        esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        
+        // Stop and uninstall driver
+        if (self->eth_handle != NULL) {
+            esp_eth_stop(self->eth_handle);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_err_t ret = esp_eth_driver_uninstall(self->eth_handle);
+            if (ret != ESP_OK) {
+                ESP_LOGE("lan", "Failed to uninstall driver: %d - ABORTING", ret);
+                mp_raise_msg(&mp_type_OSError, 
+                    MP_ERROR_TEXT("Failed to cleanup previous LAN instance - reboot required"));
+            }
+            self->eth_handle = NULL;
+            self->phy = NULL;
+        }
+        
+        // Destroy netif
+        if (self->base.netif != NULL) {
+            esp_netif_destroy(self->base.netif);
+            self->base.netif = NULL;
+        }
+        
+        // Reset state
+        self->base.active = false;
+        self->initialized = false;
+        eth_status = 0;
+        
+        // Wait for ESP-IDF cleanup
+        vTaskDelay(pdMS_TO_TICKS(500));
+        ESP_LOGI("lan", "Cleanup complete, proceeding with fresh init");
     }
 
     enum { ARG_id, ARG_mdc, ARG_mdio, ARG_reset, ARG_power, ARG_phy_addr, ARG_phy_type,
@@ -429,6 +478,55 @@ static mp_obj_t lan_config(size_t n_args, const mp_obj_t *args, mp_map_t *kwargs
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(lan_config_obj, 1, lan_config);
 
+static mp_obj_t lan_deinit(mp_obj_t self_in) {
+    lan_if_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized && self->eth_handle == NULL && self->base.netif == NULL) {
+        // Nothing to cleanup
+        return mp_const_none;
+    }
+    
+    ESP_LOGI("lan", "Deinitializing LAN interface");
+    
+    // Unregister event handlers first
+    esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+    esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+    
+    // Stop ethernet if active
+    if (self->base.active && self->eth_handle != NULL) {
+        ESP_LOGI("lan", "Stopping ethernet");
+        esp_eth_stop(self->eth_handle);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        self->base.active = false;
+    }
+    
+    // Destroy netif before driver
+    if (self->base.netif != NULL) {
+        ESP_LOGI("lan", "Destroying netif");
+        esp_netif_destroy(self->base.netif);
+        self->base.netif = NULL;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    // Uninstall driver (frees MAC, PHY, SPI)
+    if (self->eth_handle != NULL) {
+        ESP_LOGI("lan", "Uninstalling ethernet driver");
+        esp_eth_driver_uninstall(self->eth_handle);
+        self->eth_handle = NULL;
+        self->phy = NULL;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    // Reset state
+    self->initialized = false;
+    eth_status = 0;
+    
+    ESP_LOGI("lan", "Deinitialization complete");
+    
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(lan_deinit_obj, lan_deinit);
+
 static const mp_rom_map_elem_t lan_if_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_active), MP_ROM_PTR(&lan_active_obj) },
     { MP_ROM_QSTR(MP_QSTR_isconnected), MP_ROM_PTR(&lan_isconnected_obj) },
@@ -436,6 +534,8 @@ static const mp_rom_map_elem_t lan_if_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_config), MP_ROM_PTR(&lan_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_ifconfig), MP_ROM_PTR(&esp_network_ifconfig_obj) },
     { MP_ROM_QSTR(MP_QSTR_ipconfig), MP_ROM_PTR(&esp_nic_ipconfig_obj) },
+    { MP_ROM_QSTR(MP_QSTR_deinit), MP_ROM_PTR(&lan_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR___del__), MP_ROM_PTR(&lan_deinit_obj) },
 };
 
 static MP_DEFINE_CONST_DICT(lan_if_locals_dict, lan_if_locals_dict_table);
