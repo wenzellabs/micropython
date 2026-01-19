@@ -60,6 +60,9 @@ typedef struct _lan_if_obj_t {
     int8_t phy_int_pin;
     uint8_t phy_addr;
     uint8_t phy_type;
+    #if CONFIG_ETH_USE_SPI_ETHERNET
+    spi_host_device_t spi_host;  // Track which SPI bus we're using
+    #endif
     esp_eth_phy_t *phy;
     esp_eth_handle_t eth_handle;
 } lan_if_obj_t;
@@ -110,6 +113,12 @@ static void set_mac_address(lan_if_obj_t *self, uint8_t *mac, size_t len) {
 static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     lan_if_obj_t *self = &lan_obj;
 
+    ESP_LOGI("lan", "get_lan() called - initialized=%d eth_handle=%p netif=%p phy=%p active=%d",
+             self->initialized, self->eth_handle, self->base.netif, self->phy, self->base.active);
+    // DIAGNOSTIC: Log state on every call
+    mp_printf(&mp_plat_print, "[DEBUG] get_lan() called - initialized=%d eth_handle=%p netif=%p phy=%p active=%d\n",
+              self->initialized, self->eth_handle, self->base.netif, self->phy, self->base.active);
+
     if (self->initialized) {
         // Verify handles are still valid
         if (self->eth_handle != NULL && self->base.netif != NULL) {
@@ -128,16 +137,34 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         ESP_LOGI("lan", "  eth_handle=%p netif=%p phy=%p active=%d initialized=%d",
                  self->eth_handle, self->base.netif, self->phy, 
                  self->base.active, self->initialized);
+        mp_printf(&mp_plat_print, "[WARN] Leaked resources detected!\n");
+        mp_printf(&mp_plat_print, "  eth_handle=%p netif=%p phy=%p active=%d init=%d\n",
+                  self->eth_handle, self->base.netif, self->phy, 
+                  self->base.active, self->initialized);
         
-        // Unregister event handlers (ignore errors)
-        esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
-        esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        mp_printf(&mp_plat_print, "  Unregistering event handlers...\n");
         
+        // Unregister event handlers - be aggressive, try multiple times
+        for (int i = 0; i < 3; i++) {
+            esp_err_t ret1 = esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+            esp_err_t ret2 = esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+            if (ret1 == ESP_ERR_INVALID_STATE && ret2 == ESP_ERR_INVALID_STATE) {
+                // Both handlers not registered - good
+                break;
+            }
+            ESP_LOGW("lan", "Event handler unregister attempt %d: ETH=%d IP=%d", i+1, ret1, ret2);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));  // Let unregister complete
+
         // Stop and uninstall driver
         if (self->eth_handle != NULL) {
             esp_eth_stop(self->eth_handle);
             vTaskDelay(pdMS_TO_TICKS(100));
+            
+            mp_printf(&mp_plat_print, "  Calling esp_eth_driver_uninstall...\n");
             esp_err_t ret = esp_eth_driver_uninstall(self->eth_handle);
+            mp_printf(&mp_plat_print, "  Result: %d (ESP_OK=0)\n", ret);
             if (ret != ESP_OK) {
                 ESP_LOGE("lan", "Failed to uninstall driver: %d - ABORTING", ret);
                 mp_raise_msg(&mp_type_OSError, 
@@ -149,6 +176,7 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         
         // Destroy netif
         if (self->base.netif != NULL) {
+            mp_printf(&mp_plat_print, "  Calling esp_netif_destroy...\n");
             esp_netif_destroy(self->base.netif);
             self->base.netif = NULL;
         }
@@ -161,6 +189,17 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         // Wait for ESP-IDF cleanup
         vTaskDelay(pdMS_TO_TICKS(500));
         ESP_LOGI("lan", "Cleanup complete, proceeding with fresh init");
+        #if CONFIG_ETH_USE_SPI_ETHERNET
+        // CRITICAL: Try to free SPI bus if it was used for W5500/DM9051/KSZ8851
+        if (self->spi_host != 0) {
+            mp_printf(&mp_plat_print, "  WARNING: SPI bus %d may have leaked device handles\n", self->spi_host);
+            mp_printf(&mp_plat_print, "  Attempting spi_bus_free() to force cleanup...\n");
+            esp_err_t ret = spi_bus_free(self->spi_host);
+            mp_printf(&mp_plat_print, "  spi_bus_free() returned: %d\n", ret);
+            self->spi_host = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        #endif
     }
 
     enum { ARG_id, ARG_mdc, ARG_mdio, ARG_reset, ARG_power, ARG_phy_addr, ARG_phy_type,
@@ -271,6 +310,11 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
     };
     #endif
 
+    // Store SPI device handle for cleanup (W5500/DM9051/KSZ8851)
+    #if CONFIG_ETH_USE_SPI_ETHERNET
+    spi_device_handle_t spi_device_handle = NULL;
+    #endif
+
     switch (args[ARG_phy_type].u_int) {
         #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32P4
         case PHY_LAN8710:
@@ -325,10 +369,41 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         #if CONFIG_ETH_SPI_ETHERNET_W5500
         case PHY_W5500: {
             spi_host_device_t host = machine_hw_spi_get_host(args[ARG_spi].u_obj);
+
+            mp_printf(&mp_plat_print, "[DEBUG] Creating W5500 with SPI host=%d cs=%d int=%d rst=%d\n",
+                      host, self->phy_cs_pin, self->phy_int_pin, self->phy_reset_pin);
+            mp_printf(&mp_plat_print, "[DEBUG] devcfg: mode=%d speed=%d queue=%d cs=%d\n",
+                      devcfg.mode, devcfg.clock_speed_hz, devcfg.queue_size, devcfg.spics_io_num);
+
             eth_w5500_config_t chip_config = ETH_W5500_DEFAULT_CONFIG(host, &devcfg);
             chip_config.int_gpio_num = self->phy_int_pin;
+
+            mp_printf(&mp_plat_print, "[DEBUG] About to create W5500 MAC...\n");
+
             mac = esp_eth_mac_new_w5500(&chip_config, &mac_config);
+
+            mp_printf(&mp_plat_print, "[DEBUG] MAC created: %p\n", mac);
+
+            if (mac == NULL) {
+                mp_printf(&mp_plat_print, "[ERROR] esp_eth_mac_new_w5500() returned NULL!\n");
+                mp_printf(&mp_plat_print, "  This usually means spi_bus_add_device() failed inside the macro.\n");
+                mp_printf(&mp_plat_print, "  SPI bus may have leaked device handles from previous runs.\n");
+                
+                // Try to free any leaked SPI devices on this bus
+                // Unfortunately we can't access them directly...
+                mp_raise_msg(&mp_type_OSError, 
+                    MP_ERROR_TEXT("W5500 MAC creation failed - SPI device leak, reboot required"));
+            }
+
+            mp_printf(&mp_plat_print, "[DEBUG] About to create W5500 PHY...\n");
+
             self->phy = esp_eth_phy_new_w5500(&phy_config);
+
+            mp_printf(&mp_plat_print, "[DEBUG] esp_eth_phy_new_w5500() returned: %p\n", self->phy);
+                
+            if (self->phy == NULL) {
+                mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("Failed to create W5500 PHY"));
+            }
             break;
         }
         #endif
@@ -350,8 +425,16 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("esp_netif_init failed"));
     }
 
+    // Check if netif already exists and destroy it first
+    if (self->base.netif != NULL) {
+        ESP_LOGW("lan", "netif still exists before creation, destroying it");
+        esp_netif_destroy(self->base.netif);
+        self->base.netif = NULL;
+    }
+
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     self->base.netif = esp_netif_new(&cfg);
+    ESP_LOGI("lan", "Created new netif: %p", self->base.netif);
 
     if (esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL) != ESP_OK) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("esp_event_handler_register failed"));
@@ -360,14 +443,53 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
     if (esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL) != ESP_OK) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("esp_event_handler_register failed"));
     }
+    // DIAGNOSTIC: Verify MAC and PHY are valid before driver install
+    mp_printf(&mp_plat_print, "[DEBUG] About to install driver:\n");
+    mp_printf(&mp_plat_print, "  MAC: %p\n", mac);
+    mp_printf(&mp_plat_print, "  PHY: %p (type=%d addr=%d)\n", 
+              self->phy, self->phy_type, self->phy_addr);
+    if (self->phy_type == PHY_W5500) {
+        mp_printf(&mp_plat_print, "  W5500 config: spi=XX cs=%d int=%d reset=%d\n",
+                  self->phy_cs_pin, self->phy_int_pin, self->phy_reset_pin);
+    }
+    
+    // Verify MAC has required functions
+    if (mac == NULL) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("MAC is NULL!"));
+    }
 
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, self->phy);
 
     esp_err_t esp_err = esp_eth_driver_install(&config, &self->eth_handle);
+    ESP_LOGI("lan", "esp_eth_driver_install returned: %d (0x%x), handle=%p", 
+             esp_err, esp_err, self->eth_handle);
+    mp_printf(&mp_plat_print, "[DEBUG] esp_eth_driver_install returned: %d, handle=%p\n",
+              esp_err, self->eth_handle);
+
     if (esp_err == ESP_OK) {
         self->base.active = false;
         self->initialized = true;
     } else {
+        // CRITICAL FIX: Cleanup on failure!
+        mp_printf(&mp_plat_print, "[ERROR] Driver install failed! Cleaning up leaked resources...\n");
+        
+        // Unregister event handlers we just registered
+        esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        
+        // Destroy netif we just created
+        if (self->base.netif != NULL) {
+            mp_printf(&mp_plat_print, "  Destroying leaked netif %p\n", self->base.netif);
+            esp_netif_destroy(self->base.netif);
+            self->base.netif = NULL;
+        }
+        
+        // Clear PHY pointer (it was passed to driver_install, which may have partially used it)
+        self->phy = NULL;
+        
+        mp_printf(&mp_plat_print, "  Cleanup complete\n");
+        
+
         if (esp_err == ESP_ERR_INVALID_ARG) {
             mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("esp_eth_driver_install failed with invalid argument"));
         } else if (esp_err == ESP_ERR_NO_MEM) {
@@ -481,6 +603,11 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(lan_config_obj, 1, lan_config);
 static mp_obj_t lan_deinit(mp_obj_t self_in) {
     lan_if_obj_t *self = MP_OBJ_TO_PTR(self_in);
     
+    // DIAGNOSTIC
+    mp_printf(&mp_plat_print, "[DEBUG] lan_deinit() called - initialized=%d eth_handle=%p netif=%p\n",
+              self->initialized, self->eth_handle, self->base.netif);
+
+
     if (!self->initialized && self->eth_handle == NULL && self->base.netif == NULL) {
         // Nothing to cleanup
         return mp_const_none;
@@ -488,10 +615,17 @@ static mp_obj_t lan_deinit(mp_obj_t self_in) {
     
     ESP_LOGI("lan", "Deinitializing LAN interface");
     
-    // Unregister event handlers first
-    esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
-    esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
-    
+    // Unregister event handlers first - try multiple times to be sure
+    for (int i = 0; i < 3; i++) {
+        esp_err_t ret1 = esp_event_handler_unregister(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        esp_err_t ret2 = esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler);
+        if (ret1 == ESP_ERR_INVALID_STATE && ret2 == ESP_ERR_INVALID_STATE) {
+            break;  // Not registered anymore
+        }
+        ESP_LOGI("lan", "Event unregister attempt %d: ETH=%d IP=%d", i+1, ret1, ret2);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }    
+
     // Stop ethernet if active
     if (self->base.active && self->eth_handle != NULL) {
         ESP_LOGI("lan", "Stopping ethernet");
@@ -503,7 +637,9 @@ static mp_obj_t lan_deinit(mp_obj_t self_in) {
     // Destroy netif before driver
     if (self->base.netif != NULL) {
         ESP_LOGI("lan", "Destroying netif");
-        esp_netif_destroy(self->base.netif);
+        mp_printf(&mp_plat_print, "  Destroying netif %p...\n", self->base.netif);
+         esp_netif_destroy(self->base.netif);
+        mp_printf(&mp_plat_print, "  Netif destroyed\n");
         self->base.netif = NULL;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -511,7 +647,9 @@ static mp_obj_t lan_deinit(mp_obj_t self_in) {
     // Uninstall driver (frees MAC, PHY, SPI)
     if (self->eth_handle != NULL) {
         ESP_LOGI("lan", "Uninstalling ethernet driver");
-        esp_eth_driver_uninstall(self->eth_handle);
+        mp_printf(&mp_plat_print, "  Uninstalling driver %p...\n", self->eth_handle);
+        esp_err_t ret = esp_eth_driver_uninstall(self->eth_handle);
+        mp_printf(&mp_plat_print, "  Result: %d (ESP_OK=0)\n", ret);
         self->eth_handle = NULL;
         self->phy = NULL;
         vTaskDelay(pdMS_TO_TICKS(100));
