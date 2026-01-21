@@ -349,6 +349,8 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         #if CONFIG_ETH_SPI_ETHERNET_KSZ8851SNL
         case PHY_KSZ8851SNL: {
             spi_host_device_t host = machine_hw_spi_get_host(args[ARG_spi].u_obj);
+            // Remember which SPI host we used so we can free it on cleanup
+            self->spi_host = host;
             eth_ksz8851snl_config_t chip_config = ETH_KSZ8851SNL_DEFAULT_CONFIG(host, &devcfg);
             chip_config.int_gpio_num = self->phy_int_pin;
             mac = esp_eth_mac_new_ksz8851snl(&chip_config, &mac_config);
@@ -359,6 +361,8 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         #if CONFIG_ETH_SPI_ETHERNET_DM9051
         case PHY_DM9051: {
             spi_host_device_t host = machine_hw_spi_get_host(args[ARG_spi].u_obj);
+            // Remember which SPI host we used so we can free it on cleanup
+            self->spi_host = host;
             eth_dm9051_config_t chip_config = ETH_DM9051_DEFAULT_CONFIG(host, &devcfg);
             chip_config.int_gpio_num = self->phy_int_pin;
             mac = esp_eth_mac_new_dm9051(&chip_config, &mac_config);
@@ -369,6 +373,9 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
         #if CONFIG_ETH_SPI_ETHERNET_W5500
         case PHY_W5500: {
             spi_host_device_t host = machine_hw_spi_get_host(args[ARG_spi].u_obj);
+
+            // Remember which SPI host we used so we can free it on cleanup
+            self->spi_host = host;
 
             mp_printf(&mp_plat_print, "[DEBUG] Creating W5500 with SPI host=%d cs=%d int=%d rst=%d\n",
                       host, self->phy_cs_pin, self->phy_int_pin, self->phy_reset_pin);
@@ -654,6 +661,18 @@ static mp_obj_t lan_deinit(mp_obj_t self_in) {
         self->phy = NULL;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+
+#if CONFIG_ETH_USE_SPI_ETHERNET
+    // If we used a SPI-based PHY, try to free the SPI bus to avoid leaked
+    // device handles causing subsequent SPI transactions to fail.
+    if (self->spi_host != 0) {
+        mp_printf(&mp_plat_print, "  Freeing SPI bus %d...\n", self->spi_host);
+        esp_err_t sret = spi_bus_free(self->spi_host);
+        mp_printf(&mp_plat_print, "  spi_bus_free() returned: %d\n", sret);
+        self->spi_host = 0;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+#endif
     
     // Reset state
     self->initialized = false;
