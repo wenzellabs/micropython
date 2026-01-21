@@ -116,8 +116,8 @@ static mp_obj_t get_lan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_ar
     ESP_LOGI("lan", "get_lan() called - initialized=%d eth_handle=%p netif=%p phy=%p active=%d",
              self->initialized, self->eth_handle, self->base.netif, self->phy, self->base.active);
     // DIAGNOSTIC: Log state on every call
-    mp_printf(&mp_plat_print, "[DEBUG] get_lan() called - initialized=%d eth_handle=%p netif=%p phy=%p active=%d\n",
-              self->initialized, self->eth_handle, self->base.netif, self->phy, self->base.active);
+    // mp_printf(&mp_plat_print, "[DEBUG] get_lan() called - initialized=%d eth_handle=%p netif=%p phy=%p active=%d\n",
+    //           self->initialized, self->eth_handle, self->base.netif, self->phy, self->base.active);
 
     if (self->initialized) {
         // Verify handles are still valid
